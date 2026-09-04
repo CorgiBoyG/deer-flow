@@ -11,7 +11,9 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
+from deerflow.agents.middlewares.audit_context import TOOL_PROMOTION_RECORDER_CONTEXT_KEY
 from deerflow.config.tool_search_config import clamp_auto_promote_top_k
+from deerflow.runtime.events.catalog import MIDDLEWARE_TOOL_PROMOTION_TAG
 from deerflow.utils.messages import get_original_user_content_text, is_real_user_message
 
 logger = logging.getLogger(__name__)
@@ -101,7 +103,63 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
         matched.sort(key=lambda item: (-item[0], item[1]))
         return [name for _, name in matched[: self._top_k]]
 
-    def _state_update(self, state: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    def _existing_promoted_names(self, state: Mapping[str, Any] | None) -> set[str]:
+        """Names already promoted for the active catalog in graph state.
+
+        Mirrors ``merge_promoted``: promotions for a *different* catalog hash do
+        not count as already-present, because the reducer replaces (not unions)
+        across a catalog change. Only same-catalog names suppress a duplicate
+        event.
+        """
+        promoted = (state or {}).get("promoted")
+        if not isinstance(promoted, Mapping):
+            return set()
+        if promoted.get("catalog_hash") != self._catalog_hash:
+            return set()
+        names = promoted.get("names")
+        if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
+            return set()
+        return {str(name) for name in names}
+
+    def _record_promotion_event(self, runtime: Runtime, new_names: list[str]) -> None:
+        """Persist a tool-promotion transition; never break the agent run.
+
+        Emits only when at least one tool is *newly* promoted for the active
+        catalog. Content is limited to attribution + tool names, matching the
+        ``middleware:loop_detection`` precedent — no query, keywords, catalog
+        hash, or schema is persisted.
+        """
+        context = getattr(runtime, "context", None)
+        if not isinstance(context, dict):
+            return
+        is_subagent = context.get("is_subagent") is True
+        # Native task-tool subagents receive only the narrow parent-loop proxy;
+        # lead-agent runs expose the ordinary RunJournal. See audit_context.
+        recorder = context.get(TOOL_PROMOTION_RECORDER_CONTEXT_KEY)
+        if recorder is None:
+            recorder = context.get("__run_journal")
+        if recorder is None:
+            return
+
+        try:
+            recorder.record_middleware(
+                tag=MIDDLEWARE_TOOL_PROMOTION_TAG,
+                name=type(self).__name__,
+                hook="before_model",
+                action="promote",
+                changes={
+                    "source": "routing_hint",
+                    "tool_names": sorted(new_names),
+                    "count": len(new_names),
+                    "is_subagent": is_subagent,
+                    "agent_id": context.get("agent_id") if is_subagent else None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Audit persistence must never break the agent run.
+            logger.warning("Failed to record middleware:tool_promotion event", exc_info=True)
+
+    def _state_update(self, state: Mapping[str, Any] | None, runtime: Runtime | None = None) -> dict[str, Any] | None:
         names = self._matched_names(state)
         if not names:
             return None
@@ -111,6 +169,11 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
             (self._catalog_hash or "")[:8],
             names,
         )
+        if runtime is not None:
+            already = self._existing_promoted_names(state)
+            new_names = [name for name in names if name not in already]
+            if new_names:
+                self._record_promotion_event(runtime, new_names)
         return {
             "promoted": {
                 "catalog_hash": self._catalog_hash,
@@ -120,11 +183,11 @@ class McpRoutingMiddleware(AgentMiddleware[AgentState]):
 
     @override
     def before_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        return self._state_update(state)
+        return self._state_update(state, runtime)
 
     @override
     async def abefore_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        return self._state_update(state)
+        return self._state_update(state, runtime)
 
 
 def assert_mcp_routing_before_deferred_filter(middlewares: Sequence[AgentMiddleware]) -> None:

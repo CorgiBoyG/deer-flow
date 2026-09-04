@@ -3927,6 +3927,9 @@ class TestSubagentGuardrailAttribution:
         context = fake_agent.captured_context
         assert context is not None
         assert context.get("__run_loop_detection_recorder") is recorder
+        # Tool-promotion events reuse the same parent-loop proxy under a distinct
+        # key so subagent promotions forward to the journal-owning loop too.
+        assert context.get("__run_tool_promotion_recorder") is recorder
         assert "__run_journal" not in context
         assert context.get("agent_id") == "general-purpose"
 

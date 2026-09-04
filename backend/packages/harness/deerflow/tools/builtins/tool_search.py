@@ -21,7 +21,7 @@ import html
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Annotated, Any
@@ -32,7 +32,10 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langchain_core.utils.function_calling import convert_to_openai_function
 from langgraph.types import Command
 
+from deerflow.agents.middlewares.audit_context import TOOL_PROMOTION_RECORDER_CONTEXT_KEY
+from deerflow.runtime.events.catalog import MIDDLEWARE_TOOL_PROMOTION_TAG
 from deerflow.tools.mcp_metadata import get_mcp_routing, is_mcp_tool
+from deerflow.tools.types import Runtime
 
 if TYPE_CHECKING:
     from langchain.agents.middleware import AgentMiddleware
@@ -139,11 +142,70 @@ class DeferredToolSetup:
     catalog_hash: str | None
 
 
+def _existing_promoted_names(state: Mapping[str, Any] | None, catalog_hash: str) -> set[str]:
+    """Names already promoted for ``catalog_hash`` in graph state.
+
+    Mirrors ``merge_promoted``: a promotion recorded under a *different* catalog
+    hash does not count as present, because the reducer replaces (not unions)
+    across a catalog change. Only same-catalog names suppress a duplicate event.
+    """
+    promoted = (state or {}).get("promoted")
+    if not isinstance(promoted, Mapping):
+        return set()
+    if promoted.get("catalog_hash") != catalog_hash:
+        return set()
+    names = promoted.get("names")
+    if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
+        return set()
+    return {str(name) for name in names}
+
+
+def _record_tool_search_promotion(runtime: Runtime, catalog_hash: str, matched_names: list[str]) -> None:
+    """Persist an explicit tool_search promotion; never break the agent run.
+
+    Emits only for names *newly* promoted for the active catalog, computed as a
+    set difference against current graph state so repeated searches for an
+    already-loaded tool stay silent. Content mirrors the ``middleware:tool_promotion``
+    contract emitted by the auto-promote path — attribution + tool names only.
+    """
+    new_names = [name for name in matched_names if name not in _existing_promoted_names(getattr(runtime, "state", None), catalog_hash)]
+    if not new_names:
+        return
+
+    context = getattr(runtime, "context", None)
+    if not isinstance(context, dict):
+        return
+    is_subagent = context.get("is_subagent") is True
+    # Native task-tool subagents receive only the narrow parent-loop proxy;
+    # lead-agent runs expose the ordinary RunJournal. See audit_context.
+    recorder = context.get(TOOL_PROMOTION_RECORDER_CONTEXT_KEY) or context.get("__run_journal")
+    if recorder is None:
+        return
+
+    try:
+        recorder.record_middleware(
+            tag=MIDDLEWARE_TOOL_PROMOTION_TAG,
+            name="tool_search",
+            hook="tool_call",
+            action="promote",
+            changes={
+                "source": "tool_search",
+                "tool_names": sorted(new_names),
+                "count": len(new_names),
+                "is_subagent": is_subagent,
+                "agent_id": context.get("agent_id") if is_subagent else None,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        # Audit persistence must never break the agent run.
+        logger.warning("Failed to record middleware:tool_promotion event", exc_info=True)
+
+
 def build_tool_search_tool(catalog: DeferredToolCatalog) -> BaseTool:
     catalog_hash = catalog.hash
 
     @tool
-    def tool_search(query: str, tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
+    def tool_search(query: str, tool_call_id: Annotated[str, InjectedToolCallId], runtime: Runtime) -> Command:
         """Fetches full schema definitions for deferred tools so they can be called.
 
         Deferred tools appear by name in <available-deferred-tools> in the system
@@ -162,6 +224,10 @@ def build_tool_search_tool(catalog: DeferredToolCatalog) -> BaseTool:
         else:
             content = json.dumps([convert_to_openai_function(t) for t in matched], indent=2, ensure_ascii=False)
             names = [t.name for t in matched]
+            # Emit before returning the Command: the difference is computed
+            # against pre-promotion state, so a name loaded by an earlier search
+            # is already present and stays silent on a repeat.
+            _record_tool_search_promotion(runtime, catalog_hash, names)
         return Command(
             update={
                 "promoted": {"catalog_hash": catalog_hash, "names": names},

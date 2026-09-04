@@ -97,6 +97,41 @@ async def test_other_integrity_errors_are_not_duplicate_remote_tasks(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepare_thread_delete_blocks_active_tasks_and_deletes_terminal_rows(tmp_path):
+    repo = await _make_repo(tmp_path)
+    now = datetime.now(UTC)
+    await _create_working_task(repo, task_id="task-active", now=now)
+
+    assert await repo.prepare_thread_delete("thread-1", user_id="user-1") is False
+    assert await repo.get("task-active", user_id="user-1") is not None
+
+    await repo.claim_due_tasks(now=now, lease_owner="worker-1", lease_seconds=60, limit=1)
+    assert await repo.apply_snapshot(
+        "task-active",
+        lease_owner="worker-1",
+        status="completed",
+        result={"done": True},
+        result_preview=None,
+        result_truncated=False,
+        result_artifact=None,
+        error=None,
+        input_required=None,
+        next_poll_at=None,
+        polled_at=now,
+    )
+    await _create_working_task(
+        repo,
+        task_id="other-user-task",
+        now=now,
+        user_id="user-2",
+    )
+
+    assert await repo.prepare_thread_delete("thread-1", user_id="user-1") is True
+    assert await repo.get("task-active", user_id="user-1") is None
+    assert await repo.get("other-user-task", user_id="user-2") is not None
+
+
+@pytest.mark.asyncio
 async def test_claim_due_tasks_skips_live_leases_and_reclaims_expired_ones(tmp_path):
     repo = await _make_repo(tmp_path)
     now = datetime.now(UTC)
@@ -409,6 +444,66 @@ async def test_notification_snapshot_is_versioned_and_not_overwritten_in_flight(
     )
     assert second[0]["dispatch_version"] == 2
     assert second[0]["dispatch_event"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_get_claimed_notification_validates_current_lease_and_version(tmp_path):
+    repo = await _make_repo(tmp_path)
+    now = datetime.now(UTC)
+    await _create_working_task(repo, task_id="task-claimed-read", now=now)
+    await repo.claim_due_tasks(now=now, lease_owner="poller", lease_seconds=60, limit=1)
+    await repo.apply_snapshot(
+        "task-claimed-read",
+        lease_owner="poller",
+        status="completed",
+        result={"done": True},
+        result_preview=None,
+        result_truncated=False,
+        result_artifact=None,
+        error=None,
+        input_required=None,
+        next_poll_at=None,
+        polled_at=now,
+    )
+    claimed = (
+        await repo.claim_notification_work(
+            now=now,
+            lease_owner="notifier",
+            lease_seconds=60,
+            limit=1,
+            tracking_degraded_after_errors=3,
+        )
+    )[0]
+
+    current = await repo.get_claimed_notification(
+        "task-claimed-read",
+        user_id="user-1",
+        lease_owner="notifier",
+        dispatch_version=claimed["dispatch_version"],
+        now=now,
+    )
+    assert current is not None
+    assert current["notification_status"] == "claimed"
+    assert (
+        await repo.get_claimed_notification(
+            "task-claimed-read",
+            user_id="user-1",
+            lease_owner="other",
+            dispatch_version=claimed["dispatch_version"],
+            now=now,
+        )
+        is None
+    )
+    assert (
+        await repo.get_claimed_notification(
+            "task-claimed-read",
+            user_id="user-1",
+            lease_owner="notifier",
+            dispatch_version=claimed["dispatch_version"],
+            now=now + timedelta(seconds=61),
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

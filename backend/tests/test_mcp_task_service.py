@@ -619,6 +619,15 @@ async def test_cancel_recovery_failures_are_isolated_and_later_phases_continue(c
 @pytest.mark.asyncio
 async def test_notification_delivery_waits_for_successful_agent_run():
     repo = SimpleNamespace(
+        get_claimed_notification=AsyncMock(
+            return_value={
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "dispatch_event": {"status": "completed"},
+            }
+        ),
         mark_notification_dispatched=AsyncMock(return_value=True),
         finish_notification_run=AsyncMock(return_value=True),
         release_notification_claim=AsyncMock(return_value=True),
@@ -753,8 +762,48 @@ async def test_notification_failures_are_isolated_and_release_their_lease(caplog
 
 
 @pytest.mark.asyncio
+async def test_deleted_claimed_notification_exits_before_launch():
+    repo = SimpleNamespace(
+        get_claimed_notification=AsyncMock(return_value=None),
+    )
+    launch_notification = AsyncMock()
+    get_run = AsyncMock(return_value=SimpleNamespace(assistant_id="lead_agent"))
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=launch_notification,
+        get_run=get_run,
+    )
+    record = {
+        **_claimed_row(),
+        "notification_status": "claimed",
+        "dispatch_version": 2,
+        "dispatch_attempt": 0,
+        "dispatch_event": {"status": "completed"},
+    }
+
+    await service._notify_one(record, now=datetime.now(UTC))
+
+    repo.get_claimed_notification.assert_awaited_once()
+    get_run.assert_not_awaited()
+    launch_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_notification_busy_thread_replaces_claim_with_latest_event():
     repo = SimpleNamespace(
+        get_claimed_notification=AsyncMock(
+            return_value={
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "dispatch_event": {"status": "input_required"},
+            }
+        ),
         release_notification_claim=AsyncMock(return_value=True),
     )
     service = McpTaskService(
@@ -787,6 +836,16 @@ async def test_notification_busy_thread_replaces_claim_with_latest_event():
 @pytest.mark.asyncio
 async def test_notification_launch_failure_backs_off_and_replaces_with_latest_event():
     repo = SimpleNamespace(
+        get_claimed_notification=AsyncMock(
+            return_value={
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "notification_attempt_count": 3,
+                "dispatch_event": {"status": "input_required"},
+            }
+        ),
         release_notification_claim=AsyncMock(return_value=True),
     )
     service = McpTaskService(
@@ -822,6 +881,16 @@ async def test_notification_launch_failure_backs_off_and_replaces_with_latest_ev
 @pytest.mark.asyncio
 async def test_permanently_rejected_notification_is_dead_lettered():
     repo = SimpleNamespace(
+        get_claimed_notification=AsyncMock(
+            return_value={
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "notification_attempt_count": 0,
+                "dispatch_event": {"status": "completed"},
+            }
+        ),
         dead_letter_notification=AsyncMock(return_value=True),
         release_notification_claim=AsyncMock(return_value=True),
     )

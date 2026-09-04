@@ -448,6 +448,15 @@ class McpTaskService:
                 )
             return
 
+        record = await self._repository.get_claimed_notification(
+            task_id,
+            user_id=record["user_id"],
+            lease_owner=self._lease_owner,
+            dispatch_version=dispatch_version,
+            now=datetime.now(UTC),
+        )
+        if record is None:
+            return
         source_run = await self._get_run(record.get("run_id"), user_id=record["user_id"]) if record.get("run_id") else None
         try:
             result = await self._launch_notification(

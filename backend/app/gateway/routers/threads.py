@@ -716,6 +716,16 @@ async def _delete_thread_data_with_reservation(thread_id: str, request: Request)
 
     user_id = get_effective_user_id()
 
+    mcp_task_repo = getattr(request.app.state, "mcp_task_repo", None)
+    if mcp_task_repo is not None and not await mcp_task_repo.prepare_thread_delete(
+        thread_id,
+        user_id=user_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Thread has an active MCP task. Cancel it and wait for it to finish before deleting the thread.",
+        )
+
     # Close stateful MCP sessions before removing their workspace so a deleted
     # thread cannot keep writing there or expose retained state if its ID is reused.
     try:

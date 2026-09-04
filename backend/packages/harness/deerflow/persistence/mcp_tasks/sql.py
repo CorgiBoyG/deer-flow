@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -188,6 +188,34 @@ class McpTaskRepository:
         async with self._sf() as session:
             result = await session.execute(stmt)
             return [self._row_to_dict(row) for row in result.scalars()]
+
+    async def prepare_thread_delete(self, thread_id: str, *, user_id: str) -> bool:
+        """Atomically reject active work or remove the thread's terminal tasks."""
+        async with self._sf() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(McpTaskRow)
+                        .where(
+                            McpTaskRow.thread_id == thread_id,
+                            McpTaskRow.user_id == user_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if any(row.status not in _TERMINAL_STATUS_VALUES for row in rows):
+                await session.rollback()
+                return False
+            if rows:
+                await session.execute(
+                    delete(McpTaskRow).where(
+                        McpTaskRow.thread_id == thread_id,
+                        McpTaskRow.user_id == user_id,
+                    )
+                )
+            await session.commit()
+            return True
 
     async def claim_due_tasks(
         self,
@@ -518,6 +546,28 @@ class McpTaskRepository:
             result = await session.execute(stmt)
             await session.commit()
             return bool(result.rowcount)
+
+    async def get_claimed_notification(
+        self,
+        task_id: str,
+        *,
+        user_id: str,
+        lease_owner: str,
+        dispatch_version: int,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Re-read a live notification claim immediately before dispatch."""
+        stmt = select(McpTaskRow).where(
+            McpTaskRow.id == task_id,
+            McpTaskRow.user_id == user_id,
+            McpTaskRow.notification_lease_owner == lease_owner,
+            McpTaskRow.notification_lease_expires_at >= now,
+            McpTaskRow.dispatch_version == dispatch_version,
+            McpTaskRow.notification_status.in_(("claimed", "retry")),
+        )
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            return self._row_to_dict(row) if row is not None else None
 
     async def release_notification_claim(
         self,

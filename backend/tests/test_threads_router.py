@@ -57,6 +57,7 @@ class _PermissiveThreadMetaStore(MemoryThreadMetaStore):
 class _ThreadTestRunManager:
     def __init__(self):
         self.reservations: list[tuple[str, dict]] = []
+        self.reservation_active = False
 
     async def list_by_thread(self, _thread_id: str, *, user_id=None, limit: int = 100) -> list:
         return []
@@ -64,7 +65,11 @@ class _ThreadTestRunManager:
     @asynccontextmanager
     async def reserve_thread_operation(self, _thread_id: str, **_kwargs):
         self.reservations.append((_thread_id, _kwargs))
-        yield
+        self.reservation_active = True
+        try:
+            yield
+        finally:
+            self.reservation_active = False
 
 
 def _build_thread_app() -> tuple[FastAPI, InMemoryStore, InMemorySaver]:
@@ -404,6 +409,43 @@ def test_delete_thread_route_closes_browser_session(tmp_path):
     manager.close_session.assert_awaited_once_with("thread-browser")
 
 
+def test_delete_thread_route_rejects_active_mcp_task_before_cleanup(tmp_path):
+    paths = Paths(tmp_path)
+    app = make_authed_test_app()
+    app.state.run_manager = _ThreadTestRunManager()
+
+    async def prepare_thread_delete(*_args, **_kwargs):
+        assert app.state.run_manager.reservation_active is True
+        return False
+
+    app.state.mcp_task_repo = SimpleNamespace(
+        prepare_thread_delete=AsyncMock(side_effect=prepare_thread_delete),
+    )
+    app.state.thread_store.delete = AsyncMock()
+    app.include_router(threads.router)
+
+    pool = SimpleNamespace(close_scope=AsyncMock())
+    with (
+        patch("app.gateway.routers.threads.get_paths", return_value=paths),
+        patch("app.gateway.routers.threads._delete_thread_data") as delete_data,
+        patch("deerflow.mcp.session_pool.get_session_pool", return_value=pool),
+    ):
+        with TestClient(app) as client:
+            response = client.delete("/api/threads/thread-active-mcp")
+
+    assert response.status_code == 409
+    assert app.state.run_manager.reservation_active is False
+    assert response.json()["detail"] == ("Thread has an active MCP task. Cancel it and wait for it to finish before deleting the thread.")
+    reserved_user_id = app.state.run_manager.reservations[0][1]["user_id"]
+    app.state.mcp_task_repo.prepare_thread_delete.assert_awaited_once_with(
+        "thread-active-mcp",
+        user_id=reserved_user_id,
+    )
+    pool.close_scope.assert_not_awaited()
+    delete_data.assert_not_called()
+    app.state.thread_store.delete.assert_not_awaited()
+
+
 def test_delete_thread_route_closes_user_scoped_mcp_sessions(tmp_path):
     paths = Paths(tmp_path)
     app = make_authed_test_app()
@@ -411,6 +453,7 @@ def test_delete_thread_route_closes_user_scoped_mcp_sessions(tmp_path):
     app.include_router(threads.router)
 
     pool = SimpleNamespace(close_scope=AsyncMock())
+    assert not hasattr(app.state, "mcp_task_repo")
     with (
         patch("app.gateway.routers.threads.get_paths", return_value=paths),
         patch("deerflow.mcp.session_pool.get_session_pool", return_value=pool),

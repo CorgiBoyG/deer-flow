@@ -11,7 +11,8 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 
 from deerflow.runtime.events.store.memory import MemoryRunEventStore
 from deerflow.runtime.journal import RunJournal
@@ -1133,6 +1134,96 @@ class TestCallerBucketing:
         assert j.get_completion_data()["last_ai_message"] == "Canonical"
         assert j.get_completion_data()["lead_agent_tokens"] == 15
         assert j.get_completion_data()["subagent_tokens"] == 0
+
+    @pytest.mark.anyio
+    async def test_same_message_object_replay_cannot_mutate_canonical_summary(self, journal_setup):
+        j, store = journal_setup
+        run_id = uuid4()
+        message = AIMessage(content="Canonical answer")
+        response = LLMResult(generations=[[ChatGeneration(message=message)]])
+
+        j.on_llm_end(response, run_id=run_id, parent_run_id=None, tags=["lead_agent"])
+        message.content = "Replay answer"
+        message.usage_metadata = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "input_token_details": {"cache_read": 3},
+        }
+        j.on_llm_end(response, run_id=run_id, parent_run_id=None, tags=["lead_agent"])
+        message.usage_metadata["input_token_details"]["cache_read"] = 999
+        await j.flush()
+
+        messages = await store.list_messages("t1")
+        assert len(messages) == 1
+        assert messages[0]["content"]["content"] == "Canonical answer"
+        expected_usage = {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "input_token_details": {"cache_read": 3},
+        }
+        assert messages[0]["metadata"]["usage"] == expected_usage
+        assert messages[0]["content"]["usage_metadata"] == expected_usage
+        assert j.get_completion_data()["message_count"] == 1
+        assert j.get_completion_data()["last_ai_message"] == "Canonical answer"
+
+    @pytest.mark.anyio
+    async def test_positive_usage_event_does_not_retain_nested_provider_metadata(self, journal_setup):
+        j, store = journal_setup
+        usage = {
+            "input_tokens": 8,
+            "output_tokens": 3,
+            "total_tokens": 11,
+            "output_token_details": {"reasoning": 2},
+        }
+        message = AIMessage(content="Canonical with usage", usage_metadata=usage)
+        response = LLMResult(generations=[[ChatGeneration(message=message)]])
+
+        j.on_llm_end(response, run_id=uuid4(), parent_run_id=None, tags=["lead_agent"])
+        message.usage_metadata["output_token_details"]["reasoning"] = 999
+        await j.flush()
+
+        messages = await store.list_messages("t1")
+        assert len(messages) == 1
+        assert messages[0]["metadata"]["usage"]["output_token_details"] == {"reasoning": 2}
+        assert messages[0]["content"]["usage_metadata"]["output_token_details"] == {"reasoning": 2}
+
+    @pytest.mark.anyio
+    async def test_mutating_staged_message_before_flush_cannot_mutate_canonical_summary(self, journal_setup):
+        j, store = journal_setup
+        message = AIMessage(content="Canonical before flush")
+        response = LLMResult(generations=[[ChatGeneration(message=message)]])
+
+        j.on_llm_end(response, run_id=uuid4(), parent_run_id=None, tags=["lead_agent"])
+        message.content = "Mutation before flush"
+        await j.flush()
+
+        messages = await store.list_messages("t1")
+        assert len(messages) == 1
+        assert messages[0]["content"]["content"] == "Canonical before flush"
+        assert j.get_completion_data()["message_count"] == 1
+        assert j.get_completion_data()["last_ai_message"] == "Canonical before flush"
+
+    @pytest.mark.anyio
+    async def test_nested_same_message_object_replay_cannot_mutate_canonical_summary(self, journal_setup):
+        j, store = journal_setup
+        run_id = uuid4()
+        message = AIMessage(content=[{"type": "text", "text": "Canonical nested answer"}])
+        response = LLMResult(generations=[[ChatGeneration(message=message)]])
+
+        j.on_llm_end(response, run_id=run_id, parent_run_id=None, tags=["lead_agent"])
+        message.content[0]["text"] = "Replay nested answer"
+        message.usage_metadata = {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11}
+        j.on_llm_end(response, run_id=run_id, parent_run_id=None, tags=["lead_agent"])
+        await j.flush()
+
+        messages = await store.list_messages("t1")
+        assert len(messages) == 1
+        assert messages[0]["content"]["content"] == [{"type": "text", "text": "Canonical nested answer"}]
+        assert messages[0]["content"]["usage_metadata"] == message.usage_metadata
+        assert j.get_completion_data()["message_count"] == 1
+        assert j.get_completion_data()["last_ai_message"] == "Canonical nested answer"
 
     @pytest.mark.anyio
     async def test_all_zero_usage_remains_pending_and_positive_usage_enriches_it(self, journal_setup):

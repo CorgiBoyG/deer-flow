@@ -22,6 +22,7 @@ import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -58,8 +59,8 @@ _PERSISTED_HIDDEN_HUMAN_INPUT_RESPONSE_SOURCES = frozenset({"ask_clarification",
 class _PendingLlmResponse:
     llm_run_id: str
     events: list[dict]
-    messages: list[AnyMessage]
-    caller: str
+    message_count: int
+    last_ai_message: str | None
 
 
 def _should_persist_human_input_message(message: BaseMessage) -> bool:
@@ -317,6 +318,14 @@ class RunJournal(BaseCallbackHandler):
         """Extract displayable text from a message's mixed content shape."""
         return message_to_text(message, text_attribute_fallback=True)
 
+    def _message_summary_text(self, message: BaseMessage, *, caller: str | None = None) -> str | None:
+        """Return the bounded user-facing AI summary text for one message."""
+        is_ai_message = isinstance(message, AIMessage) or getattr(message, "type", None) == "ai"
+        if not is_ai_message or (caller is not None and caller != "lead_agent"):
+            return None
+        text = self._message_text(message).strip()
+        return text[:2000] if text else None
+
     def _record_message_summary(self, message: BaseMessage, *, caller: str | None = None) -> None:
         """Update run-level convenience fields for persisted run rows."""
         self._msg_count += 1
@@ -324,11 +333,9 @@ class RunJournal(BaseCallbackHandler):
         # ``last_ai_message`` should represent the lead agent's user-facing
         # answer. Middleware/subagent model calls and empty tool-call-only
         # AI messages must not overwrite the last useful assistant text.
-        is_ai_message = isinstance(message, AIMessage) or getattr(message, "type", None) == "ai"
-        if is_ai_message and (caller is None or caller == "lead_agent"):
-            text = self._message_text(message).strip()
-            if text:
-                self._last_ai_msg = text[:2000]
+        summary_text = self._message_summary_text(message, caller=caller)
+        if summary_text is not None:
+            self._last_ai_msg = summary_text
 
     def on_chain_start(
         self,
@@ -472,7 +479,9 @@ class RunJournal(BaseCallbackHandler):
 
             # Token usage from message
             usage = getattr(message, "usage_metadata", None)
-            usage_dict = dict(usage) if usage else {}
+            # Providers may mutate and reuse the same response object after the
+            # callback returns, including nested token-detail mappings.
+            usage_dict = deepcopy(dict(usage)) if usage else {}
             additional_kwargs = getattr(message, "additional_kwargs", None) or {}
             if is_canonical_callback and isinstance(additional_kwargs, dict) and additional_kwargs.get("deerflow_error_fallback"):
                 self._had_llm_error_fallback = True
@@ -704,8 +713,18 @@ class RunJournal(BaseCallbackHandler):
             return
         self._pending_llm_response = None
         self._buffer.extend(pending.events)
-        for message in pending.messages:
-            self._record_message_summary(message, caller=pending.caller)
+        self._msg_count += pending.message_count
+        if pending.last_ai_message is not None:
+            self._last_ai_msg = pending.last_ai_message
+
+    def _snapshot_message_summary(self, messages: Sequence[AnyMessage], *, caller: str) -> tuple[int, str | None]:
+        """Freeze summary fields before a provider can mutate replayed messages."""
+        last_ai_message: str | None = None
+        for message in messages:
+            summary_text = self._message_summary_text(message, caller=caller)
+            if summary_text is not None:
+                last_ai_message = summary_text
+        return len(messages), last_ai_message
 
     @staticmethod
     def _has_positive_usage(events: list[dict]) -> bool:
@@ -729,13 +748,13 @@ class RunJournal(BaseCallbackHandler):
             if isinstance(replay_metadata, Mapping):
                 replay_usage = replay_metadata.get("usage")
                 if isinstance(replay_usage, Mapping):
-                    canonical["metadata"]["usage"] = dict(replay_usage)
+                    canonical["metadata"]["usage"] = deepcopy(dict(replay_usage))
 
             canonical_content = canonical.get("content")
             replay_content = replay.get("content")
             if isinstance(canonical_content, dict) and isinstance(replay_content, Mapping) and "usage_metadata" in replay_content:
                 replay_content_usage = replay_content.get("usage_metadata")
-                canonical_content["usage_metadata"] = dict(replay_content_usage) if isinstance(replay_content_usage, Mapping) else replay_content_usage
+                canonical_content["usage_metadata"] = deepcopy(dict(replay_content_usage)) if isinstance(replay_content_usage, Mapping) else replay_content_usage
 
     def _flush_if_threshold_reached(self) -> None:
         pending_count = len(self._pending_llm_response.events) if self._pending_llm_response is not None else 0
@@ -758,9 +777,9 @@ class RunJournal(BaseCallbackHandler):
         pending = self._pending_llm_response
         if pending is not None and pending.llm_run_id == llm_run_id:
             if has_usage:
-                # The first callback's generation set, messages, caller, and
-                # non-usage payload are canonical. A provider's immediate
-                # replay may enrich only corresponding usage fields.
+                # The first callback's generation set, immutable summary,
+                # caller, and non-usage payload are canonical. A provider's
+                # immediate replay may enrich only corresponding usage fields.
                 self._merge_response_event_usage(pending.events, events)
                 self._commit_pending_llm_response()
                 self._flush_if_threshold_reached()
@@ -773,9 +792,16 @@ class RunJournal(BaseCallbackHandler):
         self._commit_pending_llm_response()
         self._flush_if_threshold_reached()
 
+        message_count, last_ai_message = self._snapshot_message_summary(messages, caller=caller)
+        pending_response = _PendingLlmResponse(
+            llm_run_id=llm_run_id,
+            events=events,
+            message_count=message_count,
+            last_ai_message=last_ai_message,
+        )
         self._counted_message_llm_run_ids.add(llm_run_id)
         self._llm_response_callers[llm_run_id] = caller
-        self._pending_llm_response = _PendingLlmResponse(llm_run_id, events, messages, caller)
+        self._pending_llm_response = pending_response
         if has_usage:
             self._commit_pending_llm_response()
         self._flush_if_threshold_reached()

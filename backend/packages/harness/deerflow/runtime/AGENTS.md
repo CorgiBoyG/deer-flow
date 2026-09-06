@@ -64,10 +64,14 @@ client input, because a welded-in seq goes stale when a fork re-seeds the feed
 **LLM response callback coalescing** (`runtime/journal.py`): a provider may fire
 `on_llm_end` twice for one LangChain run id, first without usage (or with all token
 counts zero) and immediately again with usage populated. The first callback's generation
-set is always canonical: `RunJournal` stages only its response events, messages, and
-caller, while applying the first callback's fallback state and tool-call bookkeeping
-immediately; those effects remain canonical. An adjacent same-id positive-usage replay
-may enrich only each corresponding staged event's metadata/content usage fields. Replay
+set is always canonical: `RunJournal` stages only its response events and immutable
+message-summary fields while retaining the first caller, and applies that callback's
+fallback state and tool-call bookkeeping immediately; those effects remain canonical.
+It must not retain provider-owned message objects because a provider may mutate and
+reuse the same response for the usage replay. Usage metadata is deep-snapshotted,
+including nested token-detail mappings, before it enters a staged or buffered event.
+An adjacent same-id positive-usage replay may enrich only each corresponding staged
+event's metadata/content usage fields. Replay
 generation-count differences never add, remove, or replace canonical messages. The next
 unrelated event, an effective buffer size (committed plus pending events) reaching the
 flush threshold, or an explicit flush commits the staged unit and updates the message
